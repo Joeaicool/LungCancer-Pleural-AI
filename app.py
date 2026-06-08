@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import SimpleITK as sitk
 from radiomics import featureextractor
 import urllib.request
+import gc  # 🔪 导入系统垃圾回收模块，用于内存优化
 
 # =========================
 # 1. 页面配置与高级医学 CSS
@@ -45,14 +46,15 @@ try:
     from PIL import Image
     if os.path.exists("lc.png"):
         img = Image.open("lc.png")
-        st.image(img, use_container_width=True)
+        # 修复最新 Streamlit 参数警告
+        st.image(img, use_container_width=True) 
 except Exception:
     pass
 
 # =========================
 # 2. 全局配置与特征列表
 # =========================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"  # 强制CPU运行，防止显存溢出错误
 
 ML_MODEL_PATH = "RF_PSO_best.pkl"
 DL_WEIGHT_PATH = "resnet10.pth"
@@ -109,51 +111,41 @@ def crop_roi_by_mask(image_arr, mask_arr, margin=8):
 # =========================
 # 4. 核心工具函数：模型加载与特征提取
 # =========================
+# 机器学习模型很小，保留缓存
 @st.cache_resource
 def load_ml_model():
     return joblib.load(ML_MODEL_PATH)
 
-@st.cache_resource
+# 🔪 内存手术：取消深度学习模型的缓存注解！让它用完即毁，绝不占用宝贵的 1GB 内存。
 def load_dl_model():
     sys.path.insert(0, MEDICALNET_DIR)
     from models import resnet
     
-    # 🌟 新增：自动从 GitHub Releases 下载 160MB 权重文件
     MODEL_URL = "https://github.com/Joeaicool/LungCancer-Pleural-AI/releases/download/v1.0/resnet10.pth"
-    
-    # 如果文件不存在，或者大小不正常(小于10MB)，就自动下载
     if not os.path.exists(DL_WEIGHT_PATH) or os.path.getsize(DL_WEIGHT_PATH) < 10000000:
-        with st.spinner("Downloading Deep Learning Weights (160MB) from GitHub... This will take ~20 seconds and only happen once!"):
+        with st.spinner("Downloading Deep Learning Weights (160MB)..."):
             urllib.request.urlretrieve(MODEL_URL, DL_WEIGHT_PATH)
     
-    # ================= 修复的核心部分 =================
     class MedicalNetClassifierWrapper(nn.Module):
         def __init__(self, backbone, num_classes=2):
             super().__init__()
             self.backbone = backbone
-            # 🌟 把原本的 512 改成了 2，完美匹配你的模型
             self.classifier = nn.Sequential(
                 nn.Linear(2, 100), nn.BatchNorm1d(100), nn.ReLU(inplace=True), nn.Linear(100, num_classes)
             )
         def forward(self, x):
             out = self.backbone(x)
-            # 兼容底层骨干网络的不同返回格式
             feat = out[0] if isinstance(out, (list, tuple)) else out
-            
-            # 防御性代码：确保进入全连接层前是正确的批次维度
-            if feat.dim() == 4:
-                feat = feat.unsqueeze(0)
-                
+            if feat.dim() == 4: feat = feat.unsqueeze(0)
             feat = F.adaptive_avg_pool3d(feat, output_size=1).flatten(1)
             return self.classifier(feat)
-    # ===================================================
 
-    base_model = resnet.resnet10(sample_input_W=64, sample_input_H=64, sample_input_D=64, shortcut_type='B', no_cuda=(DEVICE=="cpu"), num_seg_classes=2)
+    base_model = resnet.resnet10(sample_input_W=64, sample_input_H=64, sample_input_D=64, shortcut_type='B', no_cuda=True, num_seg_classes=2)
     model = MedicalNetClassifierWrapper(base_model)
     
-    ckpt = torch.load(DL_WEIGHT_PATH, map_location=DEVICE)
+    ckpt = torch.load(DL_WEIGHT_PATH, map_location=torch.device('cpu'))
     model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt, strict=False)
-    model.to(DEVICE).eval()
+    model.eval()
     return model
 
 def extract_dl_features(img_path, mask_path, model):
@@ -167,7 +159,7 @@ def extract_dl_features(img_path, mask_path, model):
     img_arr, mask_arr = crop_roi_by_mask(img_arr, mask_arr)
     
     x = torch.from_numpy(img_arr[None, None, ...]).float()
-    x = F.interpolate(x, size=(64, 64, 64), mode="trilinear", align_corners=False).to(DEVICE)
+    x = F.interpolate(x, size=(64, 64, 64), mode="trilinear", align_corners=False)
     
     features = {}
     def hook_fn(m, i): features["feat"] = i[0].clone().view(i[0].size(0), -1)
@@ -177,8 +169,13 @@ def extract_dl_features(img_path, mask_path, model):
         _ = model(x)
     handle.remove()
     
-    feat_vector = features["feat"][0].cpu().numpy()
-    return {"DL_feat_0005": feat_vector[5], "DL_feat_0012": feat_vector[12]}
+    feat_vector = features["feat"][0].numpy()
+    
+    # 🔪 内存手术：立刻销毁巨大的图像矩阵变量
+    del image, mask, img_arr, mask_arr, x
+    gc.collect()
+    
+    return {"DL_feat_0005": float(feat_vector[5]), "DL_feat_0012": float(feat_vector[12])}
 
 def extract_radiomics_features(img_path, mask_path):
     settings = {"binWidth": 25, "resampledPixelSpacing": [1.0, 1.0, 1.0], "interpolator": sitk.sitkBSpline, "correctMask": True, "label": 1}
@@ -197,6 +194,10 @@ def extract_radiomics_features(img_path, mask_path):
     mask = sitk.BinaryThreshold(sitk.Cast(mask, sitk.sitkFloat32), lowerThreshold=0.5, upperThreshold=100, insideValue=1, outsideValue=0)
     
     result = extractor.execute(image, sitk.Cast(mask, sitk.sitkUInt8))
+    
+    # 🔪 内存手术：影像组学算完后，立刻销毁图片对象和提取器
+    del image, mask, extractor
+    gc.collect()
     
     extracted_rad = {}
     for rad_name in RAD_FEATS:
@@ -234,6 +235,9 @@ st.markdown('</div>', unsafe_allow_html=True)
 _, center_col, _ = st.columns([1, 2, 1])
 if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", use_container_width=True):
     
+    # 🔪 内存手术：点击运行前，做一次全面的内存大扫除
+    gc.collect()
+    
     if not ct_file or not roi_file:
         st.error("⚠️ Please upload both CT scan and ROI mask to proceed.")
         st.stop()
@@ -249,6 +253,9 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         with st.spinner("🤖 Extracting Deep Learning Features (3D-ResNet)..."):
             dl_model = load_dl_model()
             dl_features = extract_dl_features(ct_path, roi_path, dl_model)
+            # 🔪 内存手术核心：160MB深度学习提取完毕，立刻从内存中杀掉它！给后面的影像组学腾出空间。
+            del dl_model
+            gc.collect()
             
         with st.spinner("🧬 Extracting Radiomics Features (PyRadiomics)..."):
             rad_features = extract_radiomics_features(ct_path, roi_path)
@@ -335,3 +342,9 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
 
     except Exception as e:
         st.error(f"❌ Processing Error: {str(e)}")
+        
+    finally:
+        # 🔪 内存手术：不管成功还是报错退出，最后强制删除硬盘里的占位文件和内存垃圾
+        if os.path.exists(ct_path): os.remove(ct_path)
+        if os.path.exists(roi_path): os.remove(roi_path)
+        gc.collect()
