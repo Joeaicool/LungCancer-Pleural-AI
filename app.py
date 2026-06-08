@@ -14,7 +14,13 @@ import torch.nn.functional as F
 import SimpleITK as sitk
 from radiomics import featureextractor
 import urllib.request
-import gc  # 🔪 导入系统垃圾回收模块，用于内存优化
+import gc
+
+# =========================
+# 🔪 极限内存锁死设置
+# =========================
+torch.set_num_threads(1)  # 限制 PyTorch 只用一个线程，防止多线程爆内存
+DEVICE = "cpu"
 
 # =========================
 # 1. 页面配置与高级医学 CSS
@@ -39,23 +45,16 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# =========================
-# 加载题图 (lc.png)
-# =========================
 try:
     from PIL import Image
     if os.path.exists("lc.png"):
-        img = Image.open("lc.png")
-        # 修复最新 Streamlit 参数警告
-        st.image(img, use_container_width=True) 
+        st.image(Image.open("lc.png"), use_container_width=True)
 except Exception:
     pass
 
 # =========================
 # 2. 全局配置与特征列表
 # =========================
-DEVICE = "cpu"  # 强制CPU运行，防止显存溢出错误
-
 ML_MODEL_PATH = "RF_PSO_best.pkl"
 DL_WEIGHT_PATH = "resnet10.pth"
 MEDICALNET_DIR = "./MedicalNet"
@@ -88,7 +87,7 @@ DL_FEATS = ["DL_feat_0005", "DL_feat_0012"]
 RAD_FEATS = [f for f in ALL_FEATURES if f not in CLINICAL_FEATS and f not in DL_FEATS]
 
 # =========================
-# 3. 核心工具函数：图像预处理
+# 3. 核心工具函数：图像预处理与极致裁切
 # =========================
 def window_clip_array(arr, level=40, width=400):
     arr = arr.astype(np.float32)
@@ -98,25 +97,45 @@ def window_clip_array(arr, level=40, width=400):
     arr = (arr - low) / max(high - low, 1e-6)
     return arr * 2.0 - 1.0
 
-def crop_roi_by_mask(image_arr, mask_arr, margin=8):
+# 🌟 新增：超级裁切函数，把整个大肺部裁成只有肿瘤的小方块！
+def save_cropped_niftis(img_path, mask_path, out_img_path, out_mask_path, margin=15):
+    img = sitk.ReadImage(img_path)
+    mask = sitk.ReadImage(mask_path)
+    
+    mask_arr = sitk.GetArrayFromImage(mask)
     coords = np.argwhere(mask_arr > 0)
-    if coords.shape[0] == 0: return image_arr, mask_arr
-    zmin, ymin, xmin = coords.min(axis=0)
-    zmax, ymax, xmax = coords.max(axis=0)
-    D, H, W = image_arr.shape
-    zmin, ymin, xmin = max(zmin-margin, 0), max(ymin-margin, 0), max(xmin-margin, 0)
-    zmax, ymax, xmax = min(zmax+margin+1, D), min(ymax+margin+1, H), min(xmax+margin+1, W)
-    return image_arr[zmin:zmax, ymin:ymax, xmin:xmax], mask_arr[zmin:zmax, ymin:ymax, xmin:xmax]
+    
+    if coords.shape[0] > 0:
+        zmin, ymin, xmin = coords.min(axis=0)
+        zmax, ymax, xmax = coords.max(axis=0)
+        
+        D, H, W = mask_arr.shape
+        zmin, ymin, xmin = max(0, zmin-margin), max(0, ymin-margin), max(0, xmin-margin)
+        zmax, ymax, xmax = min(D, zmax+margin), min(H, ymax+margin), min(W, xmax+margin)
+        
+        # SimpleITK 的切片顺序是 [X, Y, Z]
+        cropped_img = img[xmin:xmax, ymin:ymax, zmin:zmax]
+        cropped_mask = mask[xmin:xmax, ymin:ymax, zmin:zmax]
+        
+        sitk.WriteImage(cropped_img, out_img_path)
+        sitk.WriteImage(cropped_mask, out_mask_path)
+        
+        del cropped_img, cropped_mask
+    else:
+        # 兜底：如果找不到肿瘤，就传原图
+        sitk.WriteImage(img, out_img_path)
+        sitk.WriteImage(mask, out_mask_path)
+        
+    del img, mask, mask_arr
+    gc.collect()
 
 # =========================
 # 4. 核心工具函数：模型加载与特征提取
 # =========================
-# 机器学习模型很小，保留缓存
 @st.cache_resource
 def load_ml_model():
     return joblib.load(ML_MODEL_PATH)
 
-# 🔪 内存手术：取消深度学习模型的缓存注解！让它用完即毁，绝不占用宝贵的 1GB 内存。
 def load_dl_model():
     sys.path.insert(0, MEDICALNET_DIR)
     from models import resnet
@@ -150,13 +169,9 @@ def load_dl_model():
 
 def extract_dl_features(img_path, mask_path, model):
     image = sitk.ReadImage(img_path)
-    mask = sitk.ReadImage(mask_path)
-    
+    # 不再需要裁切，因为输入进来的已经是裁切好的小图了！
     img_arr = sitk.GetArrayFromImage(image).astype(np.float32)
-    mask_arr = sitk.GetArrayFromImage(mask).astype(np.uint8)
-    
     img_arr = window_clip_array(img_arr)
-    img_arr, mask_arr = crop_roi_by_mask(img_arr, mask_arr)
     
     x = torch.from_numpy(img_arr[None, None, ...]).float()
     x = F.interpolate(x, size=(64, 64, 64), mode="trilinear", align_corners=False)
@@ -171,8 +186,7 @@ def extract_dl_features(img_path, mask_path, model):
     
     feat_vector = features["feat"][0].numpy()
     
-    # 🔪 内存手术：立刻销毁巨大的图像矩阵变量
-    del image, mask, img_arr, mask_arr, x
+    del image, img_arr, x
     gc.collect()
     
     return {"DL_feat_0005": float(feat_vector[5]), "DL_feat_0012": float(feat_vector[12])}
@@ -195,7 +209,6 @@ def extract_radiomics_features(img_path, mask_path):
     
     result = extractor.execute(image, sitk.Cast(mask, sitk.sitkUInt8))
     
-    # 🔪 内存手术：影像组学算完后，立刻销毁图片对象和提取器
     del image, mask, extractor
     gc.collect()
     
@@ -235,7 +248,6 @@ st.markdown('</div>', unsafe_allow_html=True)
 _, center_col, _ = st.columns([1, 2, 1])
 if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", use_container_width=True):
     
-    # 🔪 内存手术：点击运行前，做一次全面的内存大扫除
     gc.collect()
     
     if not ct_file or not roi_file:
@@ -243,26 +255,32 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         st.stop()
         
     try:
-        with st.spinner("Saving uploaded files..."):
+        with st.spinner("Step 1/5: Saving and Pre-processing files..."):
             temp_dir = tempfile.mkdtemp()
-            ct_path = os.path.join(temp_dir, "ct.nii.gz")
-            roi_path = os.path.join(temp_dir, "roi.nii.gz")
+            ct_path = os.path.join(temp_dir, "raw_ct.nii.gz")
+            roi_path = os.path.join(temp_dir, "raw_roi.nii.gz")
+            crop_ct_path = os.path.join(temp_dir, "crop_ct.nii.gz")
+            crop_roi_path = os.path.join(temp_dir, "crop_roi.nii.gz")
+            
             with open(ct_path, "wb") as f: f.write(ct_file.getbuffer())
             with open(roi_path, "wb") as f: f.write(roi_file.getbuffer())
+            
+            # 🔪 执行肿瘤区域裁切！将巨大的影像变为极小的方块，保证绝不爆内存！
+            save_cropped_niftis(ct_path, roi_path, crop_ct_path, crop_roi_path)
 
-        with st.spinner("🤖 Extracting Deep Learning Features (3D-ResNet)..."):
+        with st.spinner("Step 2/5: 🤖 Extracting Deep Learning Features (3D-ResNet)..."):
             dl_model = load_dl_model()
-            dl_features = extract_dl_features(ct_path, roi_path, dl_model)
-            # 🔪 内存手术核心：160MB深度学习提取完毕，立刻从内存中杀掉它！给后面的影像组学腾出空间。
+            # 喂给模型的是裁切后的极小图像
+            dl_features = extract_dl_features(crop_ct_path, crop_roi_path, dl_model)
             del dl_model
             gc.collect()
             
-        with st.spinner("🧬 Extracting Radiomics Features (PyRadiomics)..."):
-            rad_features = extract_radiomics_features(ct_path, roi_path)
+        with st.spinner("Step 3/5: 🧬 Extracting Radiomics Features (PyRadiomics)..."):
+            # 喂给特征提取器的也是裁切后的极小图像
+            rad_features = extract_radiomics_features(crop_ct_path, crop_roi_path)
             
-        with st.spinner("🧠 Merging Features and Predicting Pleural Invasion..."):
+        with st.spinner("Step 4/5: 🧠 Predicting Pleural Invasion..."):
             ml_model = load_ml_model()
-            
             final_data = {}
             final_data.update(clin_data)
             final_data.update(dl_features)
@@ -274,17 +292,17 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         # =========================
         # 7. 结果展示区
         # =========================
-        st.markdown('<div class="card"><div class="card-title">📊 Step 3: Diagnostic Results</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card"><div class="card-title">📊 Step 5: Diagnostic Results</div>', unsafe_allow_html=True)
         res_c1, res_c2 = st.columns([1.2, 1])
 
         with res_c1:
             st.markdown('#### 🩺 Clinical Interpretation')
             if prob_pos >= 50:
                 st.error("### ⚠️ High Risk of Pleural Invasion")
-                st.write("The model indicates a **higher likelihood** of visceral pleural invasion (VPI). Closer evaluation during surgery and potential upstaging consideration may be necessary.")
+                st.write("The model indicates a **higher likelihood** of visceral pleural invasion (VPI).")
             else:
                 st.success("### ✅ Low Risk (Intact Pleura)")
-                st.write("The model indicates a **lower likelihood** of pleural invasion. The visceral pleura is likely intact.")
+                st.write("The model indicates a **lower likelihood** of pleural invasion.")
             st.info(f"**Calculated Probability of Invasion:** **{prob_pos:.2f}%**")
             
             with st.expander("Show Extracted Features"):
@@ -304,7 +322,7 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         # =========================
         # 8. SHAP 解释区
         # =========================
-        st.markdown('<div class="card"><div class="card-title">🔍 Step 4: AI Explainability (SHAP)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card"><div class="card-title">🔍 AI Explainability (SHAP)</div>', unsafe_allow_html=True)
         with st.spinner('Calculating SHAP values...'):
             try:
                 explainer = shap.TreeExplainer(ml_model)
@@ -344,7 +362,4 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         st.error(f"❌ Processing Error: {str(e)}")
         
     finally:
-        # 🔪 内存手术：不管成功还是报错退出，最后强制删除硬盘里的占位文件和内存垃圾
-        if os.path.exists(ct_path): os.remove(ct_path)
-        if os.path.exists(roi_path): os.remove(roi_path)
         gc.collect()
