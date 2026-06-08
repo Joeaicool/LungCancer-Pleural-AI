@@ -126,17 +126,27 @@ def load_dl_model():
         with st.spinner("Downloading Deep Learning Weights (160MB) from GitHub... This will take ~20 seconds and only happen once!"):
             urllib.request.urlretrieve(MODEL_URL, DL_WEIGHT_PATH)
     
+    # ================= 修复的核心部分 =================
     class MedicalNetClassifierWrapper(nn.Module):
         def __init__(self, backbone, num_classes=2):
             super().__init__()
             self.backbone = backbone
+            # 🌟 把原本的 512 改成了 2，完美匹配你的模型
             self.classifier = nn.Sequential(
-                nn.Linear(512, 100), nn.BatchNorm1d(100), nn.ReLU(inplace=True), nn.Linear(100, num_classes)
+                nn.Linear(2, 100), nn.BatchNorm1d(100), nn.ReLU(inplace=True), nn.Linear(100, num_classes)
             )
         def forward(self, x):
-            feat = self.backbone(x)[0]
+            out = self.backbone(x)
+            # 兼容底层骨干网络的不同返回格式
+            feat = out[0] if isinstance(out, (list, tuple)) else out
+            
+            # 防御性代码：确保进入全连接层前是正确的批次维度
+            if feat.dim() == 4:
+                feat = feat.unsqueeze(0)
+                
             feat = F.adaptive_avg_pool3d(feat, output_size=1).flatten(1)
             return self.classifier(feat)
+    # ===================================================
 
     base_model = resnet.resnet10(sample_input_W=64, sample_input_H=64, sample_input_D=64, shortcut_type='B', no_cuda=(DEVICE=="cpu"), num_seg_classes=2)
     model = MedicalNetClassifierWrapper(base_model)
