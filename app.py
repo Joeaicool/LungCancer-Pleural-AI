@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import SimpleITK as sitk
 from radiomics import featureextractor
+import urllib.request
 
 # =========================
 # 1. 页面配置与高级医学 CSS
@@ -49,7 +50,7 @@ except Exception:
     pass
 
 # =========================
-# 2. 全局配置与特征列表 (🌟 严格匹配模型训练顺序 🌟)
+# 2. 全局配置与特征列表
 # =========================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -57,7 +58,6 @@ ML_MODEL_PATH = "RF_PSO_best.pkl"
 DL_WEIGHT_PATH = "resnet10.pth"
 MEDICALNET_DIR = "./MedicalNet"
 
-# 必须与模型训练时的列顺序100%一致
 ALL_FEATURES = [
     "wavelet-LLL_gldm_LargeDependenceHighGrayLevelEmphasis",
     "log-sigma-3-0-mm-3D_firstorder_Range",
@@ -81,7 +81,6 @@ ALL_FEATURES = [
     "age"
 ]
 
-# 自动分类用于提取
 CLINICAL_FEATS = ["CEA", "CA125", "age"]
 DL_FEATS = ["DL_feat_0005", "DL_feat_0012"]
 RAD_FEATS = [f for f in ALL_FEATURES if f not in CLINICAL_FEATS and f not in DL_FEATS]
@@ -118,6 +117,14 @@ def load_ml_model():
 def load_dl_model():
     sys.path.insert(0, MEDICALNET_DIR)
     from models import resnet
+    
+    # 🌟 新增：自动从 GitHub Releases 下载 160MB 权重文件
+    MODEL_URL = "https://github.com/Joeaicool/LungCancer-Pleural-AI/releases/download/v1.0/resnet10.pth"
+    
+    # 如果文件不存在，或者大小不正常(小于10MB)，就自动下载
+    if not os.path.exists(DL_WEIGHT_PATH) or os.path.getsize(DL_WEIGHT_PATH) < 10000000:
+        with st.spinner("Downloading Deep Learning Weights (160MB) from GitHub... This will take ~20 seconds and only happen once!"):
+            urllib.request.urlretrieve(MODEL_URL, DL_WEIGHT_PATH)
     
     class MedicalNetClassifierWrapper(nn.Module):
         def __init__(self, backbone, num_classes=2):
@@ -244,7 +251,6 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
             final_data.update(dl_features)
             final_data.update(rad_features)
             
-            # 严格按照 ALL_FEATURES 构造，保证顺序 100% 匹配模型！
             X_input = pd.DataFrame([[final_data[k] for k in ALL_FEATURES]], columns=ALL_FEATURES)
             prob_pos = ml_model.predict_proba(X_input)[0][1] * 100
 
