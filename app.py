@@ -292,7 +292,7 @@ if center_col.button("🚀 Run Automated Extraction & Predict", type="primary", 
         # =========================
         # 7. 结果展示区
         # =========================
-        st.markdown('<div class="card"><div class="card-title">📊 Step 5: Diagnostic Results</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card"><div class="card-title">📊 Step 3: Diagnostic Results</div>', unsafe_allow_html=True)
         res_c1, res_c2 = st.columns([1.2, 1])
 
         with res_c1:
