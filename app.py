@@ -40,7 +40,7 @@ st.markdown("""
 
 st.markdown("""
 <div class="title-box">
-    <h1>Multi-modal AI Framework for Predicting Pleural Invasion in Early Lung Cancer</h1>
+    <h1>Multi-modal AI Framework for Predicting Pleural Invasion in Small Lung Cancer</h1>
     <p>Integrating 3D Deep Learning, Radiomics, and Clinical Biomarkers</p>
 </div>
 """, unsafe_allow_html=True)
